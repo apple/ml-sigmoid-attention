@@ -73,59 +73,19 @@ inline __device__ void compute_dot_do_o(const Params &params) {
     const BlockInfo binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
-    const index_t row_offset_do = binfo.q_offset(params.do_batch_stride, params.do_row_stride, bidb)
-        + m_block * kBlockM * params.do_row_stride + bidh * params.do_head_stride;
-    const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
-        + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
     const index_t row_offset_dq_accum = binfo.q_offset(params.seqlen_q_rounded * params.h * params.d_rounded, params.h * params.d_rounded, bidb)
         + (m_block * kBlockM + (params.cu_seqlens_q == nullptr ? 0 : 128 * bidb)) * params.h * params.d_rounded + bidh * params.d_rounded;
-    const index_t row_offset_dpsum = (bidb * params.h + bidh) * params.seqlen_q_rounded + m_block * kBlockM;
-
-    Tensor gdO = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.do_ptr) + row_offset_do),
-                             Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                             make_stride(params.do_row_stride, _1{}));
-    Tensor gO = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.o_ptr) + row_offset_o),
-                            Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                            make_stride(params.o_row_stride, _1{}));
     Tensor gdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dq_accum_ptr) + row_offset_dq_accum),
                                   Shape<Int<kBlockM>, Int<kHeadDim>>{},
                                   make_stride(params.h * params.d_rounded, _1{}));
-    Tensor dP_sum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.dsoftmax_sum) + row_offset_dpsum),
-                                Shape<Int<kBlockM>>{}, Stride<_1>{});
 
-    typename Kernel_traits::GmemTiledCopydO gmem_tiled_copy_dO;
-    auto gmem_thr_copy_dO = gmem_tiled_copy_dO.get_thread_slice(tidx);
     // TODO: careful, we're zeroing out dQaccum with type float4, but when
     // we do atomicAdds, we use type float. The layouts are different. Check this.
     typename Kernel_traits::GmemTiledCopydQaccum gmem_tiled_copy_dQaccum;
     auto gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_thread_slice(tidx);
 
-    Tensor tdOgdO = gmem_thr_copy_dO.partition_S(gdO);
-    Tensor tdOgO = gmem_thr_copy_dO.partition_S(gO);
     Tensor tdQgdQaccum = gmem_thr_copy_dQaccum.partition_D(gdQaccum);
 
-    Tensor cdO = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});    // (BLK_M,BLK_K) -> (blk_m,blk_k)
-    Tensor tdOcdO = gmem_thr_copy_dO.partition_S(cdO);
-
-    // Allocate predicate tensors for k
-    Tensor tdOpdO = make_tensor<bool>(make_shape(size<2>(tdOgdO)));
-    // Set predicates for k bounds
-    #pragma unroll
-    for (int k = 0; k < size(tdOpdO); ++k) {tdOpdO(k) = get<1>(tdOcdO(0, 0, k)) < params.d;}
-
-    Tensor tdOrdO = make_fragment_like(tdOgdO);
-    Tensor tdOrO = make_fragment_like(tdOgO);
-    flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/true>(
-        gmem_tiled_copy_dO, tdOgdO, tdOrdO, tdOcdO, tdOpdO, binfo.actual_seqlen_q - m_block * kBlockM
-    );
-    flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/true>(
-        gmem_tiled_copy_dO, tdOgO, tdOrO, tdOcdO, tdOpdO, binfo.actual_seqlen_q - m_block * kBlockM
-    );
-    // By right we need to scale dP up by 1/p_dropout, but instead we don't and only scale the final
-    // results (dQ and dK) by 1/p_dropout. So we need to keep dP_sum scaled down by p_dropout here,
-    // so that (dP - dP_sum) is on the same scale.
-    dot_do_o<Kernel_traits::kGmemThreadsPerRow>(tdOrdO, tdOrO, dP_sum,
-                                                Kernel_traits::kNThreads / (Kernel_traits::kGmemThreadsPerRow), params.p_dropout);
     if (Clear_dQaccum) {
         // We're actually not zero'ing out all of dQaccum, but only the part that we're going to
         // do atomicAdds on.

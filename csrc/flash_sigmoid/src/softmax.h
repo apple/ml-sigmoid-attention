@@ -115,66 +115,125 @@ __forceinline__ __device__ void max_scale_exp2_sum(Tensor<Engine0, Layout0> &ten
     }
 }
 
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+/*--------------------------------------------------------------------------------
+Compute and return `tanh` of given scalar `a`.
+
+Solution credits--
+1. Demystifying the Nvidia Ampere Architecture through Microbenchmarking and Instruction-level Analysis
+https://arxiv.org/pdf/2208.11174
+
+2. https://forums.developer.nvidia.com/t/hardware-accelerated-computation-of-the-sigmoid-logistic-function/266206
+Njuffa: contributor at NVIDIA blogs who mentions `tanh.approx.f32`.
+--------------------------------------------------------------------------------*/
+__forceinline__ __device__ float fast_tanhf (float a)
+{
+    float r;
+    asm ("tanh.approx.f32 %0,%1; \n\t" : "=f"(r) : "f"(a));
+    return r;
+}
+
+
+/*--------------------------------------------------------------------------------
+Compute element-wise sigmoid of given tensor after scaling it.
+
+:param tensor: The tensor whose sigmoid needs to be computed.
+:param scale: The scale with which to multiply the tensor.
+
+:returns: Element-wise sigmoid `sigmoid(scale * tensor)`.
+
+Notes--
+1. The relation between `softmax` and `sigmoid` is:
+`sigmoid(x) = 0.5*(1 + tanh(0.5*x))`. However, in our code, we take the
+factor of `0.5` from `0.5*x` and incorporate it in `scale` variable by
+pre-multiplying it.
+--------------------------------------------------------------------------------*/
+template <typename Engine0, typename Layout0>
+__forceinline__ __device__
+void apply_sigmoid(Tensor<Engine0, Layout0> &tensor, const float scale) {
+    #pragma unroll
+    for (int mi = 0; mi < size(tensor); ++mi) {
+        tensor(mi) = fmaf(0.5, fast_tanhf(tensor(mi) * scale), 0.5f);
+    }
+}
+
+
+/*--------------------------------------------------------------------------------
+Define per-location application of backprop of sigmoid attention.
+
+:param a: The value of a pixel of sigmoid attention `p`.
+:param b: The corrected `dp` value based on the check in the code.
+
+:returns: A possibly faster answer of `a*(1 - a)*b`, which is the gradient
+    backpropagated through sigmoid attention mechanism.
+
+Notes--
+1. The intuition is that `a*(1 - a)*b = a*b - a^2 * b = fmaf(-a, a*b, a*b)`.
+Thus, maybe we can compute the answer faster with 2 `fmaf` applications as:
+```
+float ab = fmaf(a, b, 0);
+return fmaf(-a, ab, ab);
+```
+--------------------------------------------------------------------------------*/
+__forceinline__ __device__
+float fmaf_sigmoid_backprop(float a, float b) {
+    float ab = a * b;
+    return fmaf(-a, ab, ab);
+}
+
+
+/*--------------------------------------------------------------------------------
+Define a possibly more efficient implementation of passing gradients back
+from the outputs of the attention mechanism to its inputs.
+
+:param p: The tensor of output of sigmoid attention activations.
+:param dp: The tensor of gradient of loss with respect to sigmoid attention activations.
+
+:returns: Nothing. The `dp` is updated inplace with the answer.
+--------------------------------------------------------------------------------*/
+template <bool Is_dropout, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+__forceinline__ __device__
+void apply_sigmoid_backprop(
+    Tensor<Engine0, Layout0> &p,
+    Tensor<Engine1, Layout1> &dp
+) {
+    // Unroll for each row.
+    #pragma unroll
+    for (int mi = 0; mi < size<0>(dp); ++mi) {
+        // Unroll for each column.
+        # pragma unroll
+        for (int ni = 0; ni < size<1>(dp); ++ni) {
+            // Compute the tri-conditional.
+            const float a = p(mi, ni);
+            const float b = dp(mi, ni);
+            const float corrected_b = !Is_dropout || a >= 0 ? b : 0.f;
+
+            // Compute and fill the answer in the second input tensor.
+            dp(mi, ni) = fmaf_sigmoid_backprop(
+                /*a=*/a,
+                /*b=*/corrected_b
+            );
+        }
+    }
+}
+
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int kNRows>
 struct Softmax {
 
-    using TensorT = decltype(make_tensor<float>(Shape<Int<kNRows>>{}));
-    TensorT row_max, row_sum;
-
     __forceinline__ __device__ Softmax() {};
 
-    template<bool Is_first, bool Check_inf=false, typename Tensor0, typename Tensor1>
-    __forceinline__ __device__ void softmax_rescale_o(Tensor0 &acc_s, Tensor1 &acc_o, float softmax_scale_log2) {
+    template<typename Tensor0>
+    __forceinline__ __device__ void softmax_rescale_o(Tensor0 &acc_s, float softmax_scale_log2) {
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(decltype(size<0>(scores))::value == kNRows);
-        if (Is_first) {
-            flash::template reduce_max</*zero_init=*/true>(scores, row_max);
-            flash::scale_apply_exp2(scores, row_max, softmax_scale_log2);
-            flash::reduce_sum</*zero_init=*/true>(scores, row_sum);
-        } else {
-            Tensor scores_max_prev = make_fragment_like(row_max);
-            cute::copy(row_max, scores_max_prev);
-            flash::template reduce_max</*zero_init=*/false>(scores, row_max);
-            // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
-            Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
-            static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
-            #pragma unroll
-            for (int mi = 0; mi < size(row_max); ++mi) {
-                float scores_max_cur = !Check_inf
-                    ? row_max(mi)
-                    : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
-                float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
-                row_sum(mi) *= scores_scale;
-                #pragma unroll
-                for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale; }
-            }
-            flash::scale_apply_exp2(scores, row_max, softmax_scale_log2);
-            // We don't do the reduce across threads here since we don't need to use the row_sum.
-            // We do that reduce at the end when we need to normalize the softmax.
-            flash::reduce_sum</*zero_init=*/false>(scores, row_sum);
-        }
-    };
-
-    template<bool Is_dropout=false, bool Split=false, typename Tensor0>
-    __forceinline__ __device__ TensorT normalize_softmax_lse(Tensor0 &acc_o, float softmax_scale, float rp_dropout=1.0) {
-        SumOp<float> sum_op;
-        quad_allreduce_(row_sum, row_sum, sum_op);
-        TensorT lse = make_fragment_like(row_sum);
-        Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
-        static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
-        #pragma unroll
-        for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
-            float sum = row_sum(mi);
-            float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
-            lse(mi) = (sum == 0.f || sum != sum) ? (Split ? -INFINITY : INFINITY) : row_max(mi) * softmax_scale + __logf(sum);
-            float scale = !Is_dropout ? inv_sum : inv_sum * rp_dropout;
-            #pragma unroll
-            for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scale; }
-        }
-        return lse;
+        apply_sigmoid(scores, softmax_scale_log2);
     };
 };
 

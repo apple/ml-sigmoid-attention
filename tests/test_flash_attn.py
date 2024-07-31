@@ -1,21 +1,18 @@
 import math
 
+import typing as t
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from flash_attn import (
+from flash_sigmoid import (
     flash_attn_func,
     flash_attn_kvpacked_func,
     flash_attn_qkvpacked_func,
-    flash_attn_varlen_func,
-    flash_attn_varlen_kvpacked_func,
-    flash_attn_varlen_qkvpacked_func,
-    flash_attn_with_kvcache,
+    # We do not support varlen and kvcache variants.
 )
-from flash_attn.bert_padding import pad_input, unpad_input
-from flash_attn.flash_attn_interface import _get_block_size_n
-from flash_attn.layers.rotary import apply_rotary_emb
+from flash_sigmoid.flash_attn_interface import _get_block_size_n
 
 MAX_HEADDIM_SM8x = 192
 
@@ -32,23 +29,26 @@ def attn_bias_from_alibi_slopes(
     batch, nheads = slopes.shape
     device = slopes.device
     slopes = rearrange(slopes, "b h -> b h 1 1")
+    row_idx = rearrange(torch.arange(seqlen_q, device=device, dtype=torch.long), "s -> s 1")
+    col_idx = torch.arange(seqlen_k, device=device, dtype=torch.long)
+    sk = (
+        seqlen_k
+        if key_padding_mask is None
+        else rearrange(key_padding_mask.sum(-1), "b -> b 1 1 1")
+    )
+    sq = (
+        seqlen_q
+        if query_padding_mask is None
+        else rearrange(query_padding_mask.sum(-1), "b -> b 1 1 1")
+    )
+    relative_pos = row_idx + sk - sq - col_idx
+
     if causal:
-        return torch.arange(-seqlen_k + 1, 1, device=device, dtype=torch.float32) * slopes
+        relative_pos = torch.masked_fill(input=relative_pos, mask=relative_pos < 0, value=0)
     else:
-        row_idx = rearrange(torch.arange(seqlen_q, device=device, dtype=torch.long), "s -> s 1")
-        col_idx = torch.arange(seqlen_k, device=device, dtype=torch.long)
-        sk = (
-            seqlen_k
-            if key_padding_mask is None
-            else rearrange(key_padding_mask.sum(-1), "b -> b 1 1 1")
-        )
-        sq = (
-            seqlen_q
-            if query_padding_mask is None
-            else rearrange(query_padding_mask.sum(-1), "b -> b 1 1 1")
-        )
-        relative_pos = torch.abs(row_idx + sk - sq - col_idx)
-        return -slopes * relative_pos.to(dtype=slopes.dtype)
+        relative_pos = torch.abs(relative_pos)
+
+    return -slopes * relative_pos.to(dtype=slopes.dtype)
 
 
 def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random"):
@@ -218,6 +218,7 @@ def attention_ref(
     window_size=(-1, -1),  # -1 means infinite window size
     upcast=True,
     reorder_ops=False,
+    sigmoid_bias: t.Optional[torch.Tensor] = None
 ):
     """
     Arguments:
@@ -236,6 +237,10 @@ def attention_ref(
         reorder_ops: whether to change the order of operations (scaling k instead of scaling k, etc.)
             without changing the math. This is to estimate the numerical error from operation
             reordering.
+        sigmoid_bias: The bias to be ADDED in sigmoid attention. If we had
+            `q @ k.T / sqrt(d)` as activations earlier, we now have
+            `q @ k.T / sqrt(d) + bias`. This bias is now a scalar for the
+            entire attention tensor. The value here will be provided by the caller.
     Output:
         output: (batch_size, seqlen_q, nheads, head_dim)
         attention: (batch_size, nheads, seqlen_q, seqlen_k), softmax after dropout
@@ -245,6 +250,9 @@ def attention_ref(
     dtype_og = q.dtype
     if upcast:
         q, k, v = q.float(), k.float(), v.float()
+
+    batch_size = q.shape[0]
+
     seqlen_q, seqlen_k = q.shape[1], k.shape[1]
     k = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
     v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
@@ -267,7 +275,10 @@ def attention_ref(
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias
-    attention = torch.softmax(scores, dim=-1).to(v.dtype)
+
+    scores += sigmoid_bias
+
+    attention = torch.sigmoid(scores).to(v.dtype)  # Softmax -> Sigmoid
     # Some rows might be completely masked out so we fill them with zero instead of NaN
     if window_size[0] >= 0 or window_size[1] >= 0:
         attention = attention.masked_fill(torch.all(local_mask, dim=-1, keepdim=True), 0.0)
@@ -300,6 +311,7 @@ def attention_kvpacked_ref(
     window_size=(-1, -1),  # -1 means infinite window size
     upcast=True,
     reorder_ops=False,
+    sigmoid_bias=None,
 ):
     return attention_ref(
         q,
@@ -314,6 +326,7 @@ def attention_kvpacked_ref(
         causal=causal,
         window_size=window_size,
         reorder_ops=reorder_ops,
+        sigmoid_bias=sigmoid_bias,
     )
 
 
@@ -377,7 +390,7 @@ def attention_blocksparse_ref(qkv, blockmask, attn_mask, dropout_p, dropout_mask
     blockmask = repeat(blockmask, "s_16 s_256 -> (s_16 16) (s_256 256)")
     blockmask = blockmask[:seqlen, :seqlen]
     scores.masked_fill_(rearrange(~blockmask, "t s -> 1 1 t s"), float("-inf"))
-    attention = torch.softmax(scores, dim=-1)
+    attention = torch.sigmoid(scores)  # Softmax -> Sigmoid
     attention = attention.masked_fill(rearrange(~attn_mask, "b s -> b 1 s 1"), 0.0)
     attention = attention.masked_fill_(rearrange(~blockmask, "t s -> 1 1 t s"), 0.0)
     attention_drop = attention.masked_fill(~dropout_mask, 0.0) / (1 - dropout_p)
@@ -462,46 +475,7 @@ def normalize_flash_attn_S(
         softmax_lse: (batch_size, nheads, seqlen_q)
         softmax_max: (batch_size, nheads, seqlen_q)
     """
-    if causal:
-        window_size = (window_size[0], 0)
-    q, k, v = q.float(), k.float(), v.float()
-    _, seqlen_q, _, head_dim = q.shape
-    seqlen_k = k.shape[1]
-    scores = torch.einsum("bthd,bshd->bhts", q / math.sqrt(head_dim), k)
-    if key_padding_mask is not None:
-        scores.masked_fill_(rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf"))
-    if window_size[0] >= 0 or window_size[1] >= 0:
-        local_mask = construct_local_mask(
-            seqlen_q,
-            seqlen_k,
-            window_size,
-            query_padding_mask,
-            key_padding_mask,
-            q.device,
-        )
-        scores.masked_fill_(local_mask, float("-inf"))
-    if attn_bias is not None:
-        scores = scores + attn_bias.to(dtype=scores.dtype)
-    block_size_n = _get_block_size_n(scores.device, head_dim, is_dropout, causal)
-    scores_block = scores.split(block_size_n, dim=-1)
-    lse_block = torch.stack([torch.logsumexp(s, dim=-1) for s in scores_block], dim=-1)
-    lse = torch.logsumexp(lse_block, dim=-1)
-    # lse could be -inf (i.e. all values in scores are -inf), and we want to set those to inf
-    # so that when we do torch.exp(m - lse), we get 0.0 instead of NaN.
-    lse[lse == float("-inf")] = float("inf")
-    scores_max_block = torch.stack([torch.amax(s, dim=-1) for s in scores_block], dim=-1)
-    cummax_block = torch.cummax(scores_max_block.flip(-1), dim=-1).values.flip(-1).unbind(dim=-1)
-    attn_unnorm_block = attn_unnorm.split(block_size_n, dim=-1)
-    attn_norm = torch.cat(
-        [
-            a * rearrange(torch.exp(m - lse), "b h s -> b h s 1")
-            for a, m in zip(attn_unnorm_block, cummax_block)
-        ],
-        dim=-1,
-    )
-    if query_padding_mask is not None:
-        attn_norm.masked_fill_(rearrange(~query_padding_mask, "b s -> b 1 s 1"), 0.0)
-    return attn_norm.to(dtype=attn_unnorm.dtype)
+    return attn_unnorm.clone()  # In our case, un-normalized attention is the output.
 
 
 def get_dropout_fraction(
@@ -641,7 +615,7 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
     #     qk.masked_fill_(causal_mask, float('-inf'))
     # m = qk.amax(-1, keepdim=True)
     # s_tmp = torch.exp((qk - m) / math.sqrt(d))
-    # p_tmp = torch.softmax(qk / math.sqrt(d), -1)
+    # p_tmp = torch.sigmoid(qk / math.sqrt(d))  # Softmax -> Sigmoid
     # p_dropped = p_tmp if dropout_mask is None else p_tmp.masked_fill(~dropout_mask, 0)
     # lse_ref = torch.logsumexp(qk / math.sqrt(d), -1)
     # qk_max1 = torch.max(qk[:, :, 128:, 192:], -1, keepdim=True).values
@@ -839,6 +813,7 @@ def test_flash_attn_varlen_qkvpacked(
         assert (dqkv - dqkv_ref).abs().max().item() <= 2 * (dqkv_pt - dqkv_ref).abs().max().item()
 
 
+@pytest.mark.parametrize("apply_sigmoid_bias", [True, False])
 @pytest.mark.parametrize("kvpacked", [True, False])
 # @pytest.mark.parametrize("kvpacked", [False])
 @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
@@ -875,10 +850,9 @@ def test_flash_attn_varlen_qkvpacked(
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
-@pytest.mark.parametrize("dropout_p", [0.0, 0.17])
-# @pytest.mark.parametrize("dropout_p", [0.17])
+@pytest.mark.parametrize("dropout_p", [0.0])  # dropout in FlashSigmoid not yet supported.
 def test_flash_attn_output(
-    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked
+    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, apply_sigmoid_bias
 ):
     if (
         max(seqlen_q, seqlen_k) >= 2048
@@ -911,8 +885,15 @@ def test_flash_attn_output(
     else:
         alibi_slopes, attn_bias = None, None
 
+    # Create sigmoid bias.
+    sigmoid_bias = (
+        torch.Tensor(1, ).to(q).uniform_(-10., 2.).float()  # Huge negative to some positive bias
+        if apply_sigmoid_bias
+        else torch.zeros(1, ).to(q).float()
+    )
+
     if kvpacked:
-        out, lse, S_dmask = flash_attn_kvpacked_func(
+        out, S_dmask = flash_attn_kvpacked_func(
             q,
             kv,
             dropout_p,
@@ -921,9 +902,10 @@ def test_flash_attn_output(
             alibi_slopes=alibi_slopes,
             deterministic=deterministic,
             return_attn_probs=True,
+            sigmoid_bias=sigmoid_bias.cpu().item(),
         )
     else:
-        out, lse, S_dmask = flash_attn_func(
+        out, S_dmask = flash_attn_func(
             q,
             k,
             v,
@@ -933,6 +915,7 @@ def test_flash_attn_output(
             alibi_slopes=alibi_slopes,
             deterministic=deterministic,
             return_attn_probs=True,
+            sigmoid_bias=sigmoid_bias.cpu().item(),
         )
     if dropout_p > 0.0:
         S_dmask_converted = convert_flash_attn_S_to_softmax(
@@ -984,6 +967,7 @@ def test_flash_attn_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            sigmoid_bias=sigmoid_bias,
         )
         out_pt, attn_pt = attention_kvpacked_ref(
             q,
@@ -997,6 +981,7 @@ def test_flash_attn_output(
             window_size=window_size,
             upcast=False,
             reorder_ops=True,
+            sigmoid_bias=sigmoid_bias,
         )
     else:
         out_ref, attn_ref = attention_ref(
@@ -1010,6 +995,7 @@ def test_flash_attn_output(
             dropout_mask,
             causal=causal,
             window_size=window_size,
+            sigmoid_bias=sigmoid_bias,
         )
         out_pt, attn_pt = attention_ref(
             q,
@@ -1024,6 +1010,7 @@ def test_flash_attn_output(
             window_size=window_size,
             upcast=False,
             reorder_ops=True,
+            sigmoid_bias=sigmoid_bias,
         )
 
     print(f"Output max diff: {(out - out_ref).abs().max().item()}")
@@ -2014,7 +2001,7 @@ def test_flash_attn_kvcache(
     # s_tmp = torch.exp((qk - m) / math.sqrt(d))
     # o1 = torch.einsum('bhst,bthd->bshd', s_tmp, v_cache_ref)
     # lse_ref = torch.logsumexp(qk / math.sqrt(d), -1)
-    # probs = torch.softmax(qk, dim=-1)
+    # probs = torch.sigmoid(qk)  # Softmax -> Sigmoid
     out_ref, _ = attention_ref(
         q_ro,
         k_cache_rep,

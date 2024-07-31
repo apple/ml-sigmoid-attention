@@ -138,6 +138,9 @@ struct Flash_fwd_params : public Qkv_params {
 
     void * __restrict__ alibi_slopes_ptr;
     index_t alibi_slopes_batch_stride;
+
+    // Keeps track of the parameter for the sigmoid bias.
+    float sigmoid_bias;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
