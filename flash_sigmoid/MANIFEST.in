@@ -1,0 +1,11 @@
+recursive-include csrc *.cu
+recursive-include csrc *.h
+recursive-include csrc *.cuh
+recursive-include csrc *.cpp
+recursive-include csrc *.hpp
+
+recursive-include flash_sigmoid *.cu
+recursive-include flash_sigmoid *.h
+recursive-include flash_sigmoid *.cuh
+recursive-include flash_sigmoid *.cpp
+recursive-include flash_sigmoid *.hpp

@@ -1,0 +1,3 @@
+[submodule "flash_sigmoid/csrc/cutlass"]
+	path = flash_sigmoid/csrc/cutlass
+	url = https://github.com/NVIDIA/cutlass.git
