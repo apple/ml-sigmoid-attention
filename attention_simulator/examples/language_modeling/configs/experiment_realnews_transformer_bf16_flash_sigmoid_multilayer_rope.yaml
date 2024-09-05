@@ -1,0 +1,279 @@
+# More advanced training recipe:
+#  - Training with RealNews (C4 subset).
+#  - Two layer 3072 block with RoPE (individual layer parameterization).
+#  - (Optional) First transformer layer uses local attention with window (32, 32).
+#  - Model is trained with sequence length 1024.
+#  - Model is evaluated at {16k, 8k, 4k, 2k, 1k}.
+#  - BF16 training precision + BF16 eval precision.
+#  - Uses FlashSigmoidAttention.
+
+# Global seed for this trial.
+seed: 1000001
+
+# Training related parameterizations.
+training:
+  max_steps: 65536
+
+  # BF16 mixed precision settings.
+  # If this is not provided then FP32.
+  scaler:
+    _target_: optorch.amp.init_grad_scaler
+    init_scale: 65536  # 2 ** 16
+    growth_factor: 2.0
+    backoff_factor: 0.5
+    growth_interval: 2000
+    precision: torch.bfloat16
+
+# Evaluation needs BF16 as well to use the same Flash kernel.
+evaluation:
+  # BF16 mixed precision settings.
+  # If this is not provided then FP32.
+  scaler:
+    _target_: optorch.amp.init_grad_scaler
+    init_scale: 65536  # 2 ** 16
+    growth_factor: 2.0
+    backoff_factor: 0.5
+    growth_interval: 2000
+    precision: torch.bfloat16
+
+# Swap this to change the underlying linear layer.
+which_linear: &which_linear
+  _target_: torch.nn.Linear
+  _partial_: true
+
+# Swap this to change the underlying normalization layer.
+norm_layer: &norm_layer
+  _target_: torch.nn.LayerNorm
+  _partial_: true
+  eps: 1e-6
+
+# Define the training datasets and related parameterizations.
+# Training progresses by iterating them sequentially.
+train_datasets:
+  - name: realnewslike
+    split: train
+    key: text
+    batch_size: 24
+    max_seq_len: 2048
+    num_workers: 11
+    pin_memory: true
+    shuffle: true
+    drop_last: true
+
+# Define the list of evaluation datasets and related parameterizations.
+test_datasets:
+
+  - name: realnewslike
+    split: validation
+    key: text
+    batch_size: 1
+    max_seq_len: 16384
+    num_workers: 0
+    pin_memory: true
+    shuffle: false
+    drop_last: false
+
+  - name: realnewslike
+    split: validation
+    key: text
+    batch_size: 1
+    max_seq_len: 8192
+    num_workers: 0
+    pin_memory: true
+    shuffle: false
+    drop_last: false
+
+  - name: realnewslike
+    split: validation
+    key: text
+    batch_size: 1
+    max_seq_len: 4096
+    num_workers: 0
+    pin_memory: true
+    shuffle: false
+    drop_last: false
+
+  - name: realnewslike
+    split: validation
+    key: text
+    batch_size: 1
+    max_seq_len: 2048
+    num_workers: 0
+    pin_memory: true
+    shuffle: false
+    drop_last: false
+
+  - name: realnewslike
+    split: validation
+    key: text
+    batch_size: 1
+    max_seq_len: 1024
+    num_workers: 0
+    pin_memory: true
+    shuffle: false
+    drop_last: false
+
+# Define the tokenizer.
+tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: google/t5-v1_1-base
+    vocab_size: 32100
+
+# A transformer consists of (a) embedding, (b) attention, (c) MLP, (d) block.
+model:
+  _target_: attention_simulator.layers.container.CausalBlockContainer
+  dim: 3072
+
+  # Weight init function
+  init_fn:
+    _target_: attention_simulator.layers.initialization.init_weights_timm
+    _partial_: true
+
+  # Projection from tokens to continuous representation.
+  input_embedding_fn:
+    _target_: torch.nn.Embedding
+    _partial_: true
+    num_embeddings: ${tokenizer.vocab_size}
+    embedding_dim: ${model.dim}
+
+  # Projection back to vocab.
+  output_embedding_fn:
+    _target_: attention_simulator.layers.linear.PreNormLinear
+    _partial_: true
+    bias: false
+    in_channels: ${model.dim}
+    out_channels: ${tokenizer.vocab_size}
+    which_linear: *which_linear
+    norm_layer: *norm_layer
+
+  # Two layers.
+  block_configs:
+
+    # First layer.
+    - _target_: attention_simulator.layers.transformer.TransformerBlock
+      _partial_: true
+      dim: ${model.dim}
+
+      # # If you want LayerScale type layers define them here.
+      # scaling_layer_fn:
+      #   _target_: attention_simulator.layers.normalization.LayerScale
+      #   _partial_: true
+      #   init_values: 1e-4
+
+      # Core attention layer
+      attn_fn:
+        _target_: attention_simulator.layers.flash_sigmoid_attention.RoPEFlashSigmoidAttention
+        _partial_: true
+        dim: ${model.dim}
+        sigmoid_bias: -7.62
+        # Uncomment for local attention:
+        # window_size: [32, 32]
+        num_heads: 12
+        bias: false
+        qk_norm: true
+        which_linear: *which_linear
+
+      # Multi-layer perceptron parameterization.
+      mlp_fn:
+        _target_: attention_simulator.layers.mlp.Mlp
+        _partial_: true
+        in_features: ${model.dim}
+        hidden_features: 12288
+        bias: false
+        act_layer:
+          _target_: torch.nn.GELU
+          _partial_: true
+        norm_layer: null
+        which_linear: *which_linear
+
+    # Second layer.
+    - _target_: attention_simulator.layers.transformer.TransformerBlock
+      _partial_: true
+      dim: ${model.dim}
+
+      # # If you want LayerScale type layers define them here.
+      # scaling_layer_fn:
+      #   _target_: attention_simulator.layers.normalization.LayerScale
+      #   _partial_: true
+      #   init_values: 1e-4
+
+      # Core attention layer
+      attn_fn:
+        _target_: attention_simulator.layers.flash_sigmoid_attention.RoPEFlashSigmoidAttention
+        _partial_: true
+        dim: ${model.dim}
+        sigmoid_bias: -7.62
+        num_heads: 12
+        bias: false
+        qk_norm: true
+        which_linear: *which_linear
+
+      # Multi-layer perceptron parameterization.
+      mlp_fn:
+        _target_: attention_simulator.layers.mlp.Mlp
+        _partial_: true
+        in_features: ${model.dim}
+        hidden_features: 12288
+        bias: false
+        act_layer:
+          _target_: torch.nn.GELU
+          _partial_: true
+        norm_layer: null
+        which_linear: *which_linear
+
+  # No position embedding layer for RoPE.
+  pe_layer_fn:
+    _target_: torch.nn.Identity
+    _partial_: true
+
+# grapher:
+#   # To use wandb set your API key and project name.
+#   _target_: attention_simulator.helpers.grapher.init_wandb
+#   base_url: FILL_ME_IN
+#   api_key: FILL_ME_IN
+#   project_name: 00-attn-sim
+#   log_dir: ${hydra:runtime.output_dir}
+#   offline: false
+#   log_every: 128
+
+# Define the optimizer to use.
+optimizer:
+  _target_: optorch.adam.AdamConfig
+  max_lr: 3e-4
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  mode: ADAMW
+
+# Define the LR scheduler to use.
+lr_scheduler:
+  _target_: optorch.schedule.build_lr_scheduler
+  config:
+    warmup_steps: 4096
+    warmup_start_value: 1e-5
+    total_steps: ${training.max_steps}
+    scheduler_type: "cosine"
+    lr_terminal_value: 1e-5
+
+# Optional text generation parameters.
+# Comment this out (or set to null) to disable generations.
+generations:
+  queries:
+    - input_text: "To be or not to be "
+      max_length: 128
+      top_p: 0.9
+      temperature: 0.6
+
+    - input_text: "To be or not to be "
+      max_length: 128
+      top_p: 0.8
+      temperature: 0.4
+
+  # BF16 mixed precision settings.
+  # If this is not provided then FP32.
+  scaler:
+    _target_: optorch.amp.init_grad_scaler
+    init_scale: 65536  # 2 ** 16
+    growth_factor: 2.0
+    backoff_factor: 0.5
+    growth_interval: 2000
+    precision: torch.bfloat16

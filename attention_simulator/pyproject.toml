@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "attention_simulator"
+version = "0.1.0"
+description = "A package for simulating and debugging attention mechanisms."
+authors = [
+    { name = "Jason Ramapuram", email = "jramapuram@apple.com" },
+]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.2.0",
+    "pandas>=1.2.0",
+    "transformers>=4.5.0",
+    "datasets>=1.6.0",
+    "dm-tree>=0.1.8",
+    "hydra-core",
+    "matplotlib",
+    "pytest",
+    "sentencepiece",
+    "python-Levenshtein",
+    "protobuf",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

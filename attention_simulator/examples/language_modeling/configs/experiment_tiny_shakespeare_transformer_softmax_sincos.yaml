@@ -1,0 +1,157 @@
+# Example single layer 384 block with SinCos on Tiny Shakespeare.
+# Model is trained with sequence length 64 and evaluated at 64 and 128.
+
+# Global seed for this trial.
+seed: 1000001
+
+# Training related parameterizations.
+training:
+  max_steps: 1000
+
+# Swap this to change the underlying linear layer.
+which_linear: &which_linear
+  _target_: torch.nn.Linear
+  _partial_: true
+
+# Swap this to change the underlying normalization layer.
+norm_layer: &norm_layer
+  _target_: torch.nn.LayerNorm
+  _partial_: true
+  eps: 1e-6
+
+# Define the training datasets and related parameterizations.
+# Training progresses by iterating them sequentially.
+train_datasets:
+  - name: tiny_shakespeare
+    split: train
+    key: Text
+    batch_size: 8
+    max_seq_len: 64
+    num_workers: 11  # OSX needs this to be 0
+    pin_memory: true
+    shuffle: true
+    drop_last: true
+
+# Define the list of evaluation datasets and related parameterizations.
+test_datasets:
+  - name: tiny_shakespeare
+    split: test
+    key: Text
+    batch_size: 8
+    max_seq_len: 64
+    num_workers: 0
+    pin_memory: true
+    shuffle: false
+    drop_last: false
+
+  - name: tiny_shakespeare
+    split: test
+    key: Text
+    batch_size: 8
+    max_seq_len: 128
+    num_workers: 0
+    pin_memory: true
+    shuffle: false
+    drop_last: false
+
+# Define the tokenizer.
+tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: google/t5-v1_1-base
+    vocab_size: 32100
+
+# A transformer consists of (a) embedding, (b) attention, (c) MLP, (d) block.
+model:
+  _target_: attention_simulator.layers.container.CausalBlockContainer
+  dim: 384
+  num_blocks: 1
+
+  # Weight init function
+  init_fn:
+    _target_: attention_simulator.layers.initialization.init_weights_timm
+    _partial_: true
+
+  # Projection from tokens to continuous representation.
+  input_embedding_fn:
+    _target_: torch.nn.Embedding
+    _partial_: true
+    num_embeddings: ${tokenizer.vocab_size}
+    embedding_dim: ${model.dim}
+
+  # Projection back to vocab.
+  output_embedding_fn:
+    _target_: attention_simulator.layers.linear.PreNormLinear
+    _partial_: true
+    bias: false
+    in_channels: ${model.dim}
+    out_channels: ${tokenizer.vocab_size}
+    which_linear: *which_linear
+    norm_layer: *norm_layer
+
+  # A parameterization of a single transformer block.
+  block_fn:
+    _target_: attention_simulator.layers.transformer.TransformerBlock
+    _partial_: true
+    dim: ${model.dim}
+
+    # Core attention layer
+    attn_fn:
+      _target_: attention_simulator.layers.attention.Attention
+      _partial_: true
+      dim: ${model.dim}
+      num_heads: 12
+      bias: false
+      qk_norm: true
+      attn_activ_fn:
+        _target_: attention_simulator.layers.activations.softmax_attention
+        _partial_: true
+      attn_temp: null
+      attn_bias: null
+      masking_fn:
+        _target_: attention_simulator.layers.masking.softmax_masking_fn
+      which_linear: *which_linear
+
+    # Multi-layer perceptron parameterization.
+    mlp_fn:
+      _target_: attention_simulator.layers.mlp.Mlp
+      _partial_: true
+      in_features: ${model.dim}
+      hidden_features: 1536
+      bias: false
+      act_layer:
+        _target_: torch.nn.GELU
+        _partial_: true
+      norm_layer: null
+      which_linear: *which_linear
+
+  # Position embedding layer.
+  pe_layer_fn:
+    _target_: attention_simulator.layers.position_embedding.SinCosPE
+    _partial_: true
+
+# Define the optimizer to use.
+optimizer:
+  _target_: optorch.adam.AdamConfig
+  max_lr: 3e-4
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  mode: ADAMW
+
+# Define the LR scheduler to use.
+lr_scheduler:
+  _target_: optorch.schedule.build_lr_scheduler
+  config:
+    warmup_steps: 100
+    warmup_start_value: 1e-5
+    total_steps: ${training.max_steps}
+    scheduler_type: "cosine"
+    lr_terminal_value: 1e-5
+
+# Optional text generation parameters.
+# Comment this out (or set to null) to disable generations.
+generations:
+  queries:
+    - input_text: "To be or not to be "
+      max_length: 128
+      top_p: 0.9
+      temperature: 0.6
