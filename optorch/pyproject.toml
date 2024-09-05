@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "optorch"
+version = "0.1.0"
+description = "A package for PyTorch-based functional implementation of standard optimizers."
+authors = [
+    { name = "Jason Ramapuram", email = "jramapuram@apple.com" },
+]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.2.0",
+    "dm-tree>=0.1.8",
+    "pytest",
+    "python-Levenshtein",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
