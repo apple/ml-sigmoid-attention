@@ -1,7 +1,7 @@
 # Sigmoid Attention
 
 This repo contains the code associated with [Theory, Analysis, and Best Practices for
-Sigmoid Self-Attention](#sigmoid-attention) [Link Incoming]
+Sigmoid Self-Attention](https://arxiv.org/abs/2409.04431)
 
 ## Components
 
@@ -41,5 +41,13 @@ bash setup.bash
 ## Citation
 If you find this work useful in your research, please cite:
 ```
-[Link Incoming]
+@article{ramapuram2024theoryanalysisbestpractices,
+      title={Theory, Analysis, and Best Practices for Sigmoid Self-Attention},
+      author={Jason Ramapuram and Federico Danieli and Eeshan Dhekane and Floris Weers and Dan Busbridge and Pierre Ablin and Tatiana Likhomanenko and Jagrit Digani and Zijin Gu and Amitis Shidani and Russ Webb},
+      year={2024},
+      eprint={2409.04431},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2409.04431},
+}
 ```
