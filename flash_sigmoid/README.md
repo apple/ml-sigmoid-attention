@@ -1,7 +1,7 @@
 # FlashSigmoid
 
 This repository contains the code for FlashSigmoid approach from the paper: [Theory, Analysis, and Best Practices for
-Sigmoid Self-Attention](#sigmoid-attention) [Link incoming].
+Sigmoid Self-Attention](https://arxiv.org/abs/2409.04431).
 
 ```python3
 # (Softmax) Attention
