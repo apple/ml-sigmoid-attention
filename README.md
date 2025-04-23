@@ -1,7 +1,7 @@
-# Sigmoid Attention
+# Sigmoid Attention (ICLR 2025)
 
 This repo contains the code associated with [Theory, Analysis, and Best Practices for
-Sigmoid Self-Attention](https://arxiv.org/abs/2409.04431) (ICLR 2025).
+Sigmoid Self-Attention](https://arxiv.org/abs/2409.04431).
 
 ## Components
 
