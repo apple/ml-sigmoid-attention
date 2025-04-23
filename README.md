@@ -11,6 +11,8 @@ The three components of this release are:
   - [Optorch](./optorch): PyTorch-based functional implementation of standard optimizers.
   - [Attention Simulator](./attention_simulator): A research friendly codebase for diagnosing and debugging attention.
 
+Next to this, we share a [Jupyter Notebook](./axlearn_load_pretrained.ipynb) that shows how to load the pre-trained weights of the 7B sigmoid (and softmax) models using [AXLearn](https://github.com/apple/axlearn).
+
 ## Installation
 
 See the `README.md` in the corresponding component for installation and usage instructions.  
