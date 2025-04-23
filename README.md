@@ -10,7 +10,7 @@ The three components of this release are:
   - [FlashSigmoid](./flash_sigmoid): A hardware aware implementation of Sigmoid Attention.
   - [Optorch](./optorch): PyTorch-based functional implementation of standard optimizers.
   - [Attention Simulator](./attention_simulator): A research friendly codebase for diagnosing and debugging attention.
-  - **New*** [7B weights](./pretrained/axlearn_load_pretrained.ipynb): One-to-one trained 7B sigmoid and 7B softmax weights (8 checkpoints along trajectory) trained using [AXLearn](https://github.com/apple/axlearn), with a deterministic dataloader for 1T tokens.
+  - (**New**) [7B weights](./pretrained/axlearn_load_pretrained.ipynb): One-to-one trained 7B sigmoid and 7B softmax weights (8 checkpoints along trajectory) trained using [AXLearn](https://github.com/apple/axlearn), with a deterministic dataloader for 1T tokens.
 
 ## Installation
 
