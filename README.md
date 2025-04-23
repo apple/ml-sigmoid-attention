@@ -5,7 +5,7 @@ Sigmoid Self-Attention](https://arxiv.org/abs/2409.04431) (ICLR 2025).
 
 ## Components
 
-The three components of this release are:
+The four components of this release are:
 
   - [FlashSigmoid](./flash_sigmoid): A hardware aware implementation of Sigmoid Attention.
   - [Optorch](./optorch): PyTorch-based functional implementation of standard optimizers.
