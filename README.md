@@ -1,17 +1,16 @@
-# Sigmoid Attention
+# Sigmoid Attention (ICLR 2025)
 
 This repo contains the code associated with [Theory, Analysis, and Best Practices for
-Sigmoid Self-Attention](https://arxiv.org/abs/2409.04431)
+Sigmoid Self-Attention](https://arxiv.org/abs/2409.04431).
 
 ## Components
 
-The three components of this release are:
+The four components of this release are:
 
   - [FlashSigmoid](./flash_sigmoid): A hardware aware implementation of Sigmoid Attention.
   - [Optorch](./optorch): PyTorch-based functional implementation of standard optimizers.
   - [Attention Simulator](./attention_simulator): A research friendly codebase for diagnosing and debugging attention.
-
-Next to this, we share a [Jupyter Notebook](./axlearn_load_pretrained.ipynb) that shows how to load the pre-trained weights of the 7B sigmoid (and softmax) models using [AXLearn](https://github.com/apple/axlearn).
+  - (**New**) [7B weights](./pretrained/axlearn_load_pretrained.ipynb): One-to-one trained 7B sigmoid and 7B softmax weights (8 checkpoints along trajectory) trained using [AXLearn](https://github.com/apple/axlearn), with a deterministic dataloader for 1T tokens.
 
 ## Installation
 
@@ -43,13 +42,11 @@ bash setup.bash
 ## Citation
 If you find this work useful in your research, please cite:
 ```
-@misc{ramapuram2024theoryanalysisbestpractices,
-      title={Theory, Analysis, and Best Practices for Sigmoid Self-Attention},
-      author={Jason Ramapuram and Federico Danieli and Eeshan Dhekane and Floris Weers and Dan Busbridge and Pierre Ablin and Tatiana Likhomanenko and Jagrit Digani and Zijin Gu and Amitis Shidani and Russ Webb},
-      year={2024},
-      eprint={2409.04431},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2409.04431},
+@inproceedings{ramapuram2025theoryanalysisbestpractices,
+  title={Theory, Analysis, and Best Practices for Sigmoid Self-Attention},
+  author={Jason Ramapuram and Federico Danieli and Eeshan Dhekane and Floris Weers and Dan Busbridge and Pierre Ablin and Tatiana Likhomanenko and Jagrit Digani and Zijin Gu and Amitis Shidani and Russ Webb},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2025},
+  url={https://openreview.net/forum?id=Zhdhg6n2OG}
 }
 ```
